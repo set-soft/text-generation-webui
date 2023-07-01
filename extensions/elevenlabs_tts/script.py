@@ -4,6 +4,7 @@ from pathlib import Path
 import elevenlabs
 import gradio as gr
 from modules import chat, shared
+from modules.logging_colors import logger
 
 params = {
     'activate': True,
@@ -130,7 +131,12 @@ def ui():
     global voices
     if not voices:
         voices = refresh_voices()
-        params['selected_voice'] = voices[0]
+        selected = params['selected_voice']
+        if selected == 'None':
+            params['selected_voice'] = voices[0]
+        elif selected not in voices:
+            logger.error(f'Selected voice {selected} not available, switching to {voices[0]}')
+            params['selected_voice'] = voices[0]
 
     # Gradio elements
     with gr.Row():
