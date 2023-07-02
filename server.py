@@ -49,6 +49,7 @@ from modules.text_generation import (
     get_encoded_length,
     stop_everything_event
 )
+VALID_MODES = ["default", "notebook", "chat"]
 
 
 def load_model_wrapper(selected_model, loader, autoload=False):
@@ -483,16 +484,28 @@ def create_file_saving_event_handlers():
         lambda: gr.update(visible=True), None, shared.gradio['file_deleter'])
 
 
+def mode_from_cli():
+    """ Returns the mode selected by the command line.
+        The 'default' value means nothing was specified. """
+    for k in VALID_MODES[1:]:
+        if getattr(shared.args, k):
+            return k
+    return VALID_MODES[0]
+
+
+def set_interface_mode(interface_mode):
+    for k in VALID_MODES[1:]:
+        setattr(shared.args, k, False)
+    if interface_mode != VALID_MODES[0]:
+        setattr(shared.args, interface_mode, True)
+
+
 def set_interface_arguments(interface_mode, extensions, bool_active):
-    modes = ["default", "notebook", "chat", "cai_chat"]
     cmd_list = vars(shared.args)
-    bool_list = [k for k in cmd_list if type(cmd_list[k]) is bool and k not in modes]
+    bool_list = [k for k in cmd_list if type(cmd_list[k]) is bool and k not in VALID_MODES]
 
     shared.args.extensions = extensions
-    for k in modes[1:]:
-        setattr(shared.args, k, False)
-    if interface_mode != "default":
-        setattr(shared.args, interface_mode, True)
+    set_interface_mode(interface_mode)
 
     for k in bool_list:
         setattr(shared.args, k, False)
@@ -733,19 +746,18 @@ def create_interface():
 
         # Interface mode tab
         with gr.Tab("Interface mode", elem_id="interface-mode"):
-            modes = ["default", "notebook", "chat"]
             current_mode = "default"
-            for mode in modes[1:]:
+            for mode in VALID_MODES[1:]:
                 if getattr(shared.args, mode):
                     current_mode = mode
                     break
 
             cmd_list = vars(shared.args)
-            bool_list = sorted([k for k in cmd_list if type(cmd_list[k]) is bool and k not in modes + ui.list_model_elements()])
+            bool_list = sorted([k for k in cmd_list if type(cmd_list[k]) is bool and k not in VALID_MODES + ui.list_model_elements()])
             bool_active = [k for k in bool_list if vars(shared.args)[k]]
 
             with gr.Row():
-                shared.gradio['interface_modes_menu'] = gr.Dropdown(choices=modes, value=current_mode, label="Mode")
+                shared.gradio['interface_modes_menu'] = gr.Dropdown(choices=VALID_MODES, value=current_mode, label="Mode")
                 shared.gradio['reset_interface'] = gr.Button("Apply and restart the interface", elem_classes="small-button")
                 shared.gradio['toggle_dark_mode'] = gr.Button('Toggle dark/light mode', elem_classes="small-button")
 
@@ -993,6 +1005,11 @@ if __name__ == "__main__":
         new_settings = json.loads(file_contents) if settings_file.suffix == "json" else yaml.safe_load(file_contents)
         for item in new_settings:
             shared.settings[item] = new_settings[item]
+        mode = new_settings.get('mode', None)
+        if mode is not None:
+            if mode not in VALID_MODES:
+                logger.error(f'Unknown mode {mode} ignoring it')
+                shared.settings['mode'] = None
 
     # Set default model settings based on settings file
     shared.model_config['.*'] = {
@@ -1000,6 +1017,7 @@ if __name__ == "__main__":
         'model_type': 'None',
         'groupsize': 'None',
         'pre_layer': 0,
+        # The mode will be applied when loading the model, and only if not modified by the command line or the model
         'mode': shared.settings['mode'],
         'skip_special_tokens': shared.settings['skip_special_tokens'],
         'custom_stopping_strings': shared.settings['custom_stopping_strings'],
@@ -1007,19 +1025,6 @@ if __name__ == "__main__":
     }
 
     shared.model_config.move_to_end('.*', last=False)  # Move to the beginning
-
-    # Default extensions
-    extensions_module.available_extensions = utils.get_available_extensions()
-    if shared.is_chat():
-        for extension in shared.settings['chat_default_extensions']:
-            shared.args.extensions = shared.args.extensions or []
-            if extension not in shared.args.extensions:
-                shared.args.extensions.append(extension)
-    else:
-        for extension in shared.settings['default_extensions']:
-            shared.args.extensions = shared.args.extensions or []
-            if extension not in shared.args.extensions:
-                shared.args.extensions.append(extension)
 
     available_models = utils.get_available_models()
 
@@ -1053,10 +1058,28 @@ if __name__ == "__main__":
         shared.settings.update(model_settings)  # hijacking the interface defaults
         update_model_parameters(model_settings, initial=True)  # hijacking the command-line arguments
 
+        # Apply the mode if specified
+        mode = model_settings.get('mode', None)
+        if mode_from_cli() == VALID_MODES[0] and mode is not None and mode in VALID_MODES:
+            set_interface_mode(mode)
+
         # Load the model
         shared.model, shared.tokenizer = load_model(shared.model_name)
         if shared.args.lora:
             add_lora_to_model(shared.args.lora)
+
+    # Default extensions
+    extensions_module.available_extensions = utils.get_available_extensions()
+    if shared.is_chat():
+        for extension in shared.settings['chat_default_extensions']:
+            shared.args.extensions = shared.args.extensions or []
+            if extension not in shared.args.extensions:
+                shared.args.extensions.append(extension)
+    else:
+        for extension in shared.settings['default_extensions']:
+            shared.args.extensions = shared.args.extensions or []
+            if extension not in shared.args.extensions:
+                shared.args.extensions.append(extension)
 
     # Force a character to be loaded
     if shared.is_chat():
