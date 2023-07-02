@@ -1010,6 +1010,10 @@ if __name__ == "__main__":
             if mode not in VALID_MODES:
                 logger.error(f'Unknown mode {mode} ignoring it')
                 shared.settings['mode'] = None
+        if shared.args.model is None:
+            model = new_settings.get('model', None)
+            if model is not None:
+                shared.args.model = model
 
     # Set default model settings based on settings file
     shared.model_config['.*'] = {
