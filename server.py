@@ -484,10 +484,19 @@ def create_file_saving_event_handlers():
         lambda: gr.update(visible=True), None, shared.gradio['file_deleter'])
 
 
+def mode_from_cli():
+    """ Returns the mode selected by the command line.
+        The 'default' value means nothing was specified. """
+    for k in VALID_MODES[1:]:
+        if getattr(shared.args, k):
+            return k
+    return VALID_MODES[0]
+
+
 def set_interface_mode(interface_mode):
     for k in VALID_MODES[1:]:
         setattr(shared.args, k, False)
-    if interface_mode != "default":
+    if interface_mode != VALID_MODES[0]:
         setattr(shared.args, interface_mode, True)
 
 
@@ -1000,8 +1009,7 @@ if __name__ == "__main__":
         if mode is not None:
             if mode not in VALID_MODES:
                 logger.error(f'Unknown mode {mode} ignoring it')
-            else:
-                set_interface_mode(mode)
+                shared.settings['mode'] = None
 
     # Set default model settings based on settings file
     shared.model_config['.*'] = {
@@ -1009,6 +1017,7 @@ if __name__ == "__main__":
         'model_type': 'None',
         'groupsize': 'None',
         'pre_layer': 0,
+        # The mode will be applied when loading the model, and only if not modified by the command line or the model
         'mode': shared.settings['mode'],
         'skip_special_tokens': shared.settings['skip_special_tokens'],
         'custom_stopping_strings': shared.settings['custom_stopping_strings'],
@@ -1016,19 +1025,6 @@ if __name__ == "__main__":
     }
 
     shared.model_config.move_to_end('.*', last=False)  # Move to the beginning
-
-    # Default extensions
-    extensions_module.available_extensions = utils.get_available_extensions()
-    if shared.is_chat():
-        for extension in shared.settings['chat_default_extensions']:
-            shared.args.extensions = shared.args.extensions or []
-            if extension not in shared.args.extensions:
-                shared.args.extensions.append(extension)
-    else:
-        for extension in shared.settings['default_extensions']:
-            shared.args.extensions = shared.args.extensions or []
-            if extension not in shared.args.extensions:
-                shared.args.extensions.append(extension)
 
     available_models = utils.get_available_models()
 
@@ -1062,10 +1058,28 @@ if __name__ == "__main__":
         shared.settings.update(model_settings)  # hijacking the interface defaults
         update_model_parameters(model_settings, initial=True)  # hijacking the command-line arguments
 
+        # Apply the mode if specified
+        mode = model_settings.get('mode', None)
+        if mode_from_cli() == VALID_MODES[0] and mode is not None and mode in VALID_MODES:
+            set_interface_mode(mode)
+
         # Load the model
         shared.model, shared.tokenizer = load_model(shared.model_name)
         if shared.args.lora:
             add_lora_to_model(shared.args.lora)
+
+    # Default extensions
+    extensions_module.available_extensions = utils.get_available_extensions()
+    if shared.is_chat():
+        for extension in shared.settings['chat_default_extensions']:
+            shared.args.extensions = shared.args.extensions or []
+            if extension not in shared.args.extensions:
+                shared.args.extensions.append(extension)
+    else:
+        for extension in shared.settings['default_extensions']:
+            shared.args.extensions = shared.args.extensions or []
+            if extension not in shared.args.extensions:
+                shared.args.extensions.append(extension)
 
     # Force a character to be loaded
     if shared.is_chat():
