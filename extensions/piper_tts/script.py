@@ -5,21 +5,31 @@ import os
 import pycountry
 import requests
 from modules.logging_colors import logger
+from pprint import pprint
 
 DEFAULT_VOICE = "en_US-libritts-high"
 REPO_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
 VOICES_JSON = "voices.json"
 DATA_DIR = os.path.dirname(__file__)
+VOICE_TYPE = ['Primary', 'Secondary']
 # Only one speaker available
 ONLY_ONE = "Only one"
 params = {
     "activate": True,
-    "selected_voice": "es_ES-sharvard-medium",
-    "speaker": "F",
+    "enable_0": True,
+    "selected_voice_0": "es_ES-sharvard-medium",
+    "speaker_0": "F",
+    "enable_1": True,
+    "selected_voice_1": "es_ES-sharvard-medium",
+    "speaker_1": "M",
 }
+# Data as in the JSON (model_id -> full_data)
 voices_data = None
+# Classified by language (language -> [model_id ...]
 voices_by_lang = None
+# language -> {Visible name -> full_data}
 name_to_voice = None
+# A list containing the available languages, using the visible name
 languages = None
 
 
@@ -63,14 +73,20 @@ def lang_code_to_name(ln):
             pycountry.countries.get(alpha_2=co_code_2).name + ')')
 
 
+def get_voice_name(v):
+    return f"{v['name']} ({v['quality']})"
+
+
 def refresh_voices(force_dl=False):
     global voices_data
     global voices_by_lang
     global languages
+    global name_to_voice
     if voices_data is None:
         voices_data = {}
         voices_by_lang = defaultdict(list)
         languages = set()
+        name_to_voice = defaultdict(dict)
 
     file_data = os.path.join(DATA_DIR, VOICES_JSON)
     if os.path.isfile(file_data) and not force_dl:
@@ -105,6 +121,7 @@ def refresh_voices(force_dl=False):
     voices_data = jdata
     voices_by_lang = defaultdict(list)
     languages = set()
+    name_to_voice = defaultdict(dict)
     total = 0
     for id, data in voices_data.items():
         if id != f"{data['language']}-{data['name']}-{data['quality']}":
@@ -112,9 +129,12 @@ def refresh_voices(force_dl=False):
             continue
         lang = lang_code_to_name(data['language'])
         voices_by_lang[lang].append(id)
+        vis_name = get_voice_name(data)
+        name_to_voice[lang][vis_name] = data
         languages.add(lang)
         total += data['num_speakers']
         voices_data[id]['lang_name'] = lang
+        voices_data[id]['vis_name'] = vis_name
         voices_data[id]['id'] = id
     languages = sorted(list(languages))
     logger.debug(f'Piper available languages: {len(languages)}')
@@ -122,14 +142,14 @@ def refresh_voices(force_dl=False):
     logger.debug(f'Piper available voices: {total}')
 
 
-def refresh_voices_dd():
-    """ Force a network refresh """
+def refresh_voices_dd_1(id):
+    """ Ensure the selected voice/speaker are available """
+    # Helpers
     no_change = gr.Dropdown.update()
     no_changes = (no_change, no_change, no_change)
 
-    refresh_voices(force_dl=True)
-    selected = params['selected_voice']
-    speaker = params['speaker']
+    selected = params[f'selected_voice_{int(id)}']
+    speaker = params[f'speaker_{int(id)}']
     sel_data = voices_data.get(selected)
     if sel_data is not None:
         # The selected voice is there
@@ -169,40 +189,34 @@ def refresh_voices_dd():
     return (no_change, gr.Dropdown.update(choices=avail_names, value=new_name), speaker_upd)
 
 
-def get_voice_name(v):
-    return f"{v['name']} ({v['quality']})"
+def refresh_voices_dd():
+    """ Force a network refresh """
+    refresh_voices(force_dl=True)
+    return refresh_voices_dd_1(0) + refresh_voices_dd_1(1)
 
 
 def get_voices_for_lang(lang):
-    global name_to_voice
-    names = []
-    name_to_voice = {}
-    for v in voices_by_lang[lang]:
-        data = voices_data[v]
-        name = get_voice_name(data)
-        names.append(name)
-        name_to_voice[name] = data
-    return names
+    return sorted([v['vis_name'] for v in name_to_voice[lang].values()])
 
 
 def change_lang(lang, name):
-    # Update the voice name, use the first for this language
-    print(f"change_lang `{lang}`")
+    """ Update the voice name, use the first for this language if the previous isn't available """
     avail_names = get_voices_for_lang(lang)
     if name not in avail_names:
        name = avail_names[0]
     return gr.Dropdown.update(choices=avail_names, value=name)
 
 
-def change_voice_name(name, speaker):
-    # Update the speaker list and selection
-    print(f"change_voice_name `{name}`")
-    current_voice_data = name_to_voice[name]
-    params['selected_voice'] = current_voice_data['id']
-    logger.debug(f"Selecting piper voice id: {params['selected_voice']}")
+def change_voice_name(id, lang, name, speaker):
+    """ Update the speaker list and selection """
+    id = int(id)
+    sel_v = f'selected_voice_{id}'
+    current_voice_data = name_to_voice[lang][name]
+    params[sel_v] = current_voice_data['id']
+    logger.debug(f"Selecting piper voice id {id}: `{params[sel_v]}`")
     avail_speakers, new_speaker, interactive = get_new_speaker(current_voice_data, speaker)
     return (gr.Dropdown.update(choices=avail_speakers, value=new_speaker, interactive=interactive),
-            gr.HTML.update(value=get_sample_html()))
+            gr.HTML.update(value=get_sample_html(id)))
 
 
 def get_new_speaker(data, speaker, inform=False):
@@ -214,17 +228,19 @@ def get_new_speaker(data, speaker, inform=False):
     return (avail_speakers, new_speaker, interactive)
 
 
-def change_speaker(speaker):
-    params['speaker'] = speaker if speaker != ONLY_ONE else ''
-    print(f"change_speaker `{params['speaker']}`")
-    return gr.HTML.update(value=get_sample_html())
+def change_speaker(id, speaker):
+    id = int(id)
+    speaker_v = f'speaker_{id}'
+    params[speaker_v] = speaker if speaker != ONLY_ONE else ''
+    logger.debug(f"Selecting piper speaker {id}: `{params[speaker_v]}`")
+    return gr.HTML.update(value=get_sample_html(id))
 
 
-def get_sample_url(data=None, speaker=None):
+def get_sample_url(id, data=None, speaker=None):
     if data is None:
-        data = voices_data[params['selected_voice']]
+        data = voices_data[params[f'selected_voice_{int(id)}']]
     if speaker is None:
-        speaker = params['speaker']
+        speaker = params[f'speaker_{int(id)}']
     # Find the dir
     dir_name = os.path.dirname(next(iter(data['files'])))
     speaker = str(data['speaker_id_map'].get(speaker, 0))
@@ -232,46 +248,63 @@ def get_sample_url(data=None, speaker=None):
     return os.path.join(REPO_URL, dir_name, file)
 
 
-def get_sample_html(data=None, speaker=None):
-    return f'<audio src="{get_sample_url(data, speaker)}" controls></audio>'
+def get_sample_html(id, data=None, speaker=None):
+    return f'<audio src="{get_sample_url(id, data, speaker)}" controls></audio>'
+
+
+def add_voice_ui(id):
+    # Parameters with the id
+    sel_v = f'selected_voice_{id}'
+    speaker_v = f'speaker_{id}'
+    enable_v = f'enable_{id}'
+
+    selected = params[sel_v]
+    if selected == 'None' or selected is None:
+        # TODO: select a voice according to the locale language
+        selected = params[sel_v] = DEFAULT_VOICE
+    elif selected not in voices_data:
+        logger.warning(f'Selected voice `{selected}` not available, switching to {DEFAULT_VOICE}')
+        selected = params[sel_v] = DEFAULT_VOICE
+
+    current_voice_data = voices_data[selected]
+    sel_lang = current_voice_data['lang_name']
+    names = get_voices_for_lang(sel_lang)
+    sel_name = current_voice_data['vis_name']
+    speakers, sel_speaker, interactive_sp = get_new_speaker(current_voice_data, params[speaker_v], inform=True)
+
+    with gr.Accordion(VOICE_TYPE[id] + " voice parameters", open=False):
+        with gr.Row():
+            language = gr.Dropdown(value=sel_lang, choices=languages, label='Language')
+            name = gr.Dropdown(value=sel_name, choices=names, label='Voice name (quality)')
+            voice_id = gr.Number(value=id, visible=False)
+
+        with gr.Row():
+            speaker = gr.Dropdown(value=sel_speaker, choices=speakers, label='Speaker', interactive=interactive_sp)
+            with gr.Column():
+                activate = gr.Checkbox(value=params[enable_v], label='Enabled')
+                audio_player = gr.HTML(value=get_sample_html(id, current_voice_data, sel_speaker))
+
+    # Event functions to update the parameters in the backend
+    language.change(change_lang, inputs=[language, name], outputs=[name])
+    name.change(change_voice_name, inputs=[voice_id, language, name, speaker], outputs=[speaker, audio_player])
+    speaker.change(change_speaker, inputs=[voice_id, speaker], outputs=[audio_player])
+    activate.change(lambda x: params.update({enable_v: x}), activate, None)
+    return [language, name, speaker]
 
 
 def ui():
     if not voices_data:
         refresh_voices()
-    selected = params['selected_voice']
-    if selected == 'None' or selected is None:
-        # TODO: select a voice according to the locale language
-        selected = params['selected_voice'] = DEFAULT_VOICE
-    elif selected not in voices_data:
-        logger.warning(f'Selected voice `{selected}` not available, switching to {DEFAULT_VOICE}')
-        selected = params['selected_voice'] = DEFAULT_VOICE
-
-    current_voice_data = voices_data[selected]
-    sel_lang = current_voice_data['lang_name']
-    names = get_voices_for_lang(sel_lang)
-    sel_name = get_voice_name(current_voice_data)
-    speakers, sel_speaker, interactive_sp = get_new_speaker(current_voice_data, params['speaker'], inform=True)
 
     # Gradio elements
     with gr.Row():
-        activate = gr.Checkbox(value=params['activate'], label='Activate speak')
+        activate = gr.Checkbox(value=params['activate'], label='Activate Text To Speach')
+        refresh = gr.Button(value='Reload available voices')
 
-    with gr.Accordion("Voice parameters", open=False):
-        with gr.Row():
-            language = gr.Dropdown(value=sel_lang, choices=languages, label='Language')
-            refresh = gr.Button(value='Refresh')
-
-        with gr.Row():
-            name = gr.Dropdown(value=sel_name, choices=names, label='Name')
-            speaker = gr.Dropdown(value=sel_speaker, choices=speakers, label='Speaker', interactive=interactive_sp)
-
-        with gr.Row():
-            audio_player = gr.HTML(value=get_sample_html(current_voice_data, sel_speaker))
+    # Add controls for the primary and secondary voices
+    outs_0 = add_voice_ui(0)
+    outs_1 = add_voice_ui(1)
 
     # Event functions to update the parameters in the backend
     activate.change(lambda x: params.update({"activate": x}), activate, None)
-    language.change(change_lang, inputs=[language, name], outputs=[name])
-    name.change(change_voice_name, inputs=[name, speaker], outputs=[speaker, audio_player])
-    speaker.change(change_speaker, speaker, audio_player)
-    refresh.click(refresh_voices_dd, inputs=[], outputs=[language, name, speaker])
+    refresh.click(refresh_voices_dd, inputs=[], outputs=outs_0 + outs_1)
