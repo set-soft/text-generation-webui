@@ -216,7 +216,8 @@ def change_voice_name(id, lang, name, speaker):
     logger.debug(f"Selecting piper voice id {id}: `{params[sel_v]}`")
     avail_speakers, new_speaker, interactive = get_new_speaker(current_voice_data, speaker)
     return (gr.Dropdown.update(choices=avail_speakers, value=new_speaker, interactive=interactive),
-            gr.HTML.update(value=get_sample_html(id)))
+            gr.HTML.update(value=get_sample_html(id)),
+            gr.Accordion.update(label=voice_accordion_label(id)))
 
 
 def get_new_speaker(data, speaker, inform=False):
@@ -233,7 +234,7 @@ def change_speaker(id, speaker):
     speaker_v = f'speaker_{id}'
     params[speaker_v] = speaker if speaker != ONLY_ONE else ''
     logger.debug(f"Selecting piper speaker {id}: `{params[speaker_v]}`")
-    return gr.HTML.update(value=get_sample_html(id))
+    return (gr.HTML.update(value=get_sample_html(id)), gr.Accordion.update(label=voice_accordion_label(id)))
 
 
 def get_sample_url(id, data=None, speaker=None):
@@ -250,6 +251,19 @@ def get_sample_url(id, data=None, speaker=None):
 
 def get_sample_html(id, data=None, speaker=None):
     return f'<audio src="{get_sample_url(id, data, speaker)}" controls></audio>'
+
+
+def voice_accordion_label(id):
+    id = int(id)
+    sel_voice = params[f'selected_voice_{id}']
+    speaker_v = params[f'speaker_{id}']
+    enable_v = 'enabled' if params[f'enable_{id}'] else 'disabled'
+    return f'{VOICE_TYPE[id]} voice parameters ({sel_voice}/{speaker_v}/{enable_v})'
+
+
+def change_enabled(id, activate):
+    params[f'enable_{int(id)}'] = activate
+    return gr.Accordion.update(label=voice_accordion_label(id))
 
 
 def add_voice_ui(id):
@@ -272,7 +286,7 @@ def add_voice_ui(id):
     sel_name = current_voice_data['vis_name']
     speakers, sel_speaker, interactive_sp = get_new_speaker(current_voice_data, params[speaker_v], inform=True)
 
-    with gr.Accordion(VOICE_TYPE[id] + " voice parameters", open=False):
+    with gr.Accordion(voice_accordion_label(id), open=False) as accordion:
         with gr.Row():
             language = gr.Dropdown(value=sel_lang, choices=languages, label='Language')
             name = gr.Dropdown(value=sel_name, choices=names, label='Voice name (quality)')
@@ -286,9 +300,9 @@ def add_voice_ui(id):
 
     # Event functions to update the parameters in the backend
     language.change(change_lang, inputs=[language, name], outputs=[name])
-    name.change(change_voice_name, inputs=[voice_id, language, name, speaker], outputs=[speaker, audio_player])
-    speaker.change(change_speaker, inputs=[voice_id, speaker], outputs=[audio_player])
-    activate.change(lambda x: params.update({enable_v: x}), activate, None)
+    name.change(change_voice_name, inputs=[voice_id, language, name, speaker], outputs=[speaker, audio_player, accordion])
+    speaker.change(change_speaker, inputs=[voice_id, speaker], outputs=[audio_player, accordion])
+    activate.change(change_enabled, inputs=[voice_id, activate], outputs=[accordion])
     return [language, name, speaker]
 
 
