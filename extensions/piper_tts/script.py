@@ -1,10 +1,14 @@
 from collections import defaultdict
+import hashlib
 import gradio as gr
 import json
 import os
+from pathlib import Path
+from extensions.piper_tts.piper import Piper
 import pycountry
 import requests
 from modules.logging_colors import logger
+from modules import shared
 from pprint import pprint
 
 DEFAULT_VOICE = "en_US-libritts-high"
@@ -12,16 +16,19 @@ REPO_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
 VOICES_JSON = "voices.json"
 DATA_DIR = os.path.dirname(__file__)
 VOICE_TYPE = ['Primary', 'Secondary']
+MODELS_PATH = os.path.join("models", "piper")
 # Only one speaker available
 ONLY_ONE = "Only one"
 params = {
     "activate": True,
     "enable_0": True,
-    "selected_voice_0": "es_ES-sharvard-medium",
-    "speaker_0": "F",
+    "selected_voice_0": DEFAULT_VOICE,  # "es_ES-sharvard-medium",
+    "speaker_0": '',  # "F",
     "enable_1": True,
-    "selected_voice_1": "es_ES-sharvard-medium",
-    "speaker_1": "M",
+    "selected_voice_1": DEFAULT_VOICE,  # "es_ES-sharvard-medium",
+    "speaker_1": '',  # "M",
+    "autoplay": False,
+    "show_text": True,
 }
 # Data as in the JSON (model_id -> full_data)
 voices_data = None
@@ -31,6 +38,11 @@ voices_by_lang = None
 name_to_voice = None
 # A list containing the available languages, using the visible name
 languages = None
+wav_idx = 0
+cfg0 = None
+cfg0_name = ''
+cfg1 = None
+cfg1_name = ''
 
 
 def input_modifier(string):
@@ -41,6 +53,7 @@ def input_modifier(string):
     if not params['activate']:
         return string
 
+    shared.processing_message = "*Is recording a voice message...*"
     return string
 
 
@@ -48,9 +61,32 @@ def output_modifier(string):
     """
     This function is applied to the model outputs.
     """
+    global params, wav_idx
+
     if not params['activate']:
         return string
 
+    original_string = string
+    string = string.replace('"', '')
+    string = string.replace('“', '')
+    string = string.replace('\n', ' ')
+    string = string.strip()
+    if string == '':
+        string = 'empty reply, try regenerating'
+
+    output_file = Path(f'extensions/piper_tts/outputs/{wav_idx:06d}.wav'.format(wav_idx))
+    logger.debug(f'Outputting audio to {str(output_file)}')
+
+    gen_audio_file(string, str(output_file))
+
+    autoplay = 'autoplay' if params['autoplay'] else ''
+    string = f'<audio src="file/{output_file.as_posix()}" controls {autoplay}></audio>'
+    wav_idx += 1
+
+    if params['show_text']:
+        string += f'\n\n{original_string}'
+
+    shared.processing_message = "*Is typing...*"
     return string
 
 
@@ -61,6 +97,56 @@ def bot_prefix_modifier(string):
     behavior.
     """
     return string
+
+
+def download_model_file(f_name, name, info):
+    d_name = os.path.dirname(f_name)
+    os.makedirs(d_name, exist_ok=True)
+    url = REPO_URL + name
+    logger.debug(f'Downloading {url}')
+    result = requests.get(url=url)
+    size = len(result.content)
+    esize = info['size_bytes']
+    if size != esize:
+        raise ValueError(f'Downloaded size mismatch ({url}) {size} vs {esize}')
+    h = hashlib.md5()
+    h.update(result.content)
+    res_md5 = h.hexdigest()
+    e_md5 = info['md5_digest']
+    if res_md5 != e_md5:
+        raise ValueError(f'Downloaded integrity fail ({url}) {res_md5} vs {e_md5}')
+    with open(f_name, 'wb') as f:
+        f.write(result.content)
+
+
+def gen_audio_file(string, out_file):
+    # Check if configured
+    global cfg0_name, cfg0
+
+    sel = params['selected_voice_0']
+    data = voices_data[sel]
+    if sel != cfg0_name:
+        # Not configured for this voice
+        # Check the model
+        for name, info in data['files'].items():
+            f_name = os.path.join(MODELS_PATH, name)
+            if name.endswith('.onnx'):
+                model_name = f_name
+            if not os.path.isfile(f_name):
+                download_model_file(f_name, name, info)
+        # Create a Piper object
+        cfg0 = Piper(model_name)
+        cfg0_name = sel
+        # Ensure the output dir exists
+        os.makedirs(os.path.dirname(out_file), exist_ok=True)
+    sel_speaker = params['speaker_0']
+    if sel_speaker:
+        speaker_id = data['speaker_id_map'][sel_speaker]
+    else:
+        speaker_id = None
+    wav_bytes = cfg0.synthesize(string, speaker_id=speaker_id)
+    with open(out_file, 'wb') as f:
+        f.write(wav_bytes)
 
 
 def lang_code_to_name(ln):
@@ -106,13 +192,13 @@ def refresh_voices(force_dl=False):
         try:
             result = requests.get(url=url)
         except HTTPError as http_err:
-            print(f'HTTP error occurred: {http_err}')
+            logger.error(f'HTTP error occurred: {http_err}')
         except Exception as err:
-            print(f'Other error occurred: {err}')
+            logger.error(f'Other error occurred: {err}')
         if result is None:
             return
         if result.status_code != 200:
-            print(f'Wong status {result.status_code}')
+            logger.error(f'Wong status {result.status_code}')
             return
         jdata = result.json()
         logger.debug(f"Saving {file_data}")
@@ -222,7 +308,7 @@ def change_voice_name(id, lang, name, speaker):
 
 def get_new_speaker(data, speaker, inform=False):
     avail_speakers = list(data['speaker_id_map'].keys())
-    if inform and speaker not in avail_speakers:
+    if inform and speaker and speaker not in avail_speakers:
         logger.warning(f'Selected speaker `{speaker}` not available')
     interactive = len(avail_speakers) > 0
     new_speaker = (speaker if speaker in avail_speakers else avail_speakers[0]) if interactive else ONLY_ONE
@@ -256,7 +342,7 @@ def get_sample_html(id, data=None, speaker=None):
 def voice_accordion_label(id):
     id = int(id)
     sel_voice = params[f'selected_voice_{id}']
-    speaker_v = params[f'speaker_{id}']
+    speaker_v = params[f'speaker_{id}'] if params[f'speaker_{id}'] else ONLY_ONE
     enable_v = 'enabled' if params[f'enable_{id}'] else 'disabled'
     return f'{VOICE_TYPE[id]} voice parameters ({sel_voice}/{speaker_v}/{enable_v})'
 
@@ -285,6 +371,7 @@ def add_voice_ui(id):
     names = get_voices_for_lang(sel_lang)
     sel_name = current_voice_data['vis_name']
     speakers, sel_speaker, interactive_sp = get_new_speaker(current_voice_data, params[speaker_v], inform=True)
+    params[speaker_v] = sel_speaker if interactive_sp else ''
 
     with gr.Accordion(voice_accordion_label(id), open=False) as accordion:
         with gr.Row():
