@@ -97,7 +97,6 @@ class Piper:
             sid = np.array([speaker_id], dtype=np.int64)
 
         # Synthesize through Onnx
-        print(str(sid))
         audio = self.model.run(
             None,
             {
