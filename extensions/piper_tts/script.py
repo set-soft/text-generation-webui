@@ -5,12 +5,13 @@ import json
 import os
 from pathlib import Path
 from extensions.piper_tts.piper import Piper
-import pycountry
+import numpy as np
 import requests
 from modules.logging_colors import logger
 from modules import shared
-from pprint import pprint
+# from pprint import pprint
 
+Piper._LOGGER = logger
 DEFAULT_VOICE = "en_US-libritts-high"
 REPO_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
 VOICES_JSON = "voices.json"
@@ -22,11 +23,19 @@ ONLY_ONE = "Only one"
 params = {
     "activate": True,
     "enable_0": True,
-    "selected_voice_0": DEFAULT_VOICE,  # "es_ES-sharvard-medium",
+    "selected_voice_0": "en_US-amy-medium",  # "es_ES-sharvard-medium",
     "speaker_0": '',  # "F",
+    "noise_scale_0": 0.667,
+    "length_scale_0": 1,
+    "noise_w_0": 0.8,
+    "use_model_params_0": True,
     "enable_1": True,
     "selected_voice_1": DEFAULT_VOICE,  # "es_ES-sharvard-medium",
-    "speaker_1": '',  # "M",
+    "speaker_1": 'p922',  # "M",
+    "noise_scale_1": 0.667,
+    "length_scale_1": 1,
+    "noise_w_1": 0.8,
+    "use_model_params_1": True,
     "autoplay": False,
     "show_text": True,
 }
@@ -39,10 +48,9 @@ name_to_voice = None
 # A list containing the available languages, using the visible name
 languages = None
 wav_idx = 0
-cfg0 = None
-cfg0_name = ''
-cfg1 = None
-cfg1_name = ''
+cfg = [None, None]
+cfg_name = ['', '']
+speaker_id = [0, 0]
 
 
 def input_modifier(string):
@@ -66,10 +74,11 @@ def output_modifier(string):
     if not params['activate']:
         return string
 
+    logger.debug(f'Input: `{string}`')
     original_string = string
-    string = string.replace('"', '')
-    string = string.replace('“', '')
-    string = string.replace('\n', ' ')
+    # string = string.replace('"', '')
+    # string = string.replace('“', '')
+    # string = string.replace('\n', ' ')
     string = string.strip()
     if string == '':
         string = 'empty reply, try regenerating'
@@ -119,15 +128,18 @@ def download_model_file(f_name, name, info):
         f.write(result.content)
 
 
-def gen_audio_file(string, out_file):
-    # Check if configured
-    global cfg0_name, cfg0
+def check_configured(voice, out_file):
+    global cfg_name, cfg, speaker_id
 
-    sel = params['selected_voice_0']
+    s_voice = str(voice)
+    sel = params['selected_voice_' + s_voice]
+    logger.debug(f'sel {sel}')
     data = voices_data[sel]
-    if sel != cfg0_name:
+    logger.debug(f'cfg_name[voice] {cfg_name[voice]}')
+    if sel != cfg_name[voice]:
+        logger.debug(f'configurando {voice}')
         # Not configured for this voice
-        # Check the model
+        # Check the model files
         for name, info in data['files'].items():
             f_name = os.path.join(MODELS_PATH, name)
             if name.endswith('.onnx'):
@@ -135,28 +147,60 @@ def gen_audio_file(string, out_file):
             if not os.path.isfile(f_name):
                 download_model_file(f_name, name, info)
         # Create a Piper object
-        cfg0 = Piper(model_name)
-        cfg0_name = sel
+        cfg[voice] = Piper(model_name)
+        cfg_name[voice] = sel
         # Ensure the output dir exists
         os.makedirs(os.path.dirname(out_file), exist_ok=True)
-    sel_speaker = params['speaker_0']
+    sel_speaker = params['speaker_' + s_voice]
     if sel_speaker:
-        speaker_id = data['speaker_id_map'][sel_speaker]
+        speaker_id[voice] = data['speaker_id_map'][sel_speaker]
     else:
-        speaker_id = None
-    wav_bytes = cfg0.synthesize(string, speaker_id=speaker_id)
+        speaker_id[voice] = None
+
+
+def gen_audio_file(string, out_file):
+    global cfg, speaker_id
+
+    # Check if configured
+    for v in range(2):
+        check_configured(v, out_file)
+    # Separate description from dialog
+    sections = string.split('*')
+    voice = 1
+    audios = []
+    silence = np.array(11000*[0.0], dtype=np.float32)
+    enabled = (params['enable_0'], params['enable_1'])
+    # Select the generation parameters
+    noise_scale = (None, None)
+    length_scale = (None, None)
+    noise_w = (None, None)
+    if not params['use_model_params_0']:
+        noise_scale[0] = params['noise_scale_0']
+        length_scale[0] = params['length_scale_0']
+        noise_w[0] = params['noise_w_0']
+    if not params['use_model_params_1']:
+        noise_scale[1] = params['noise_scale_1']
+        length_scale[1] = params['length_scale_1']
+        noise_w[1] = params['noise_w_1']
+
+    for s in sections:
+        # Alternate voices
+        voice = 1 - voice
+        s = s.strip()
+        logger.debug(f'{voice}: {s}')
+        if not s or not enabled[voice]:
+            # Skip empty sections
+            continue
+        audios.extend(cfg[voice].synthesize_partial(s, speaker_id=speaker_id[voice], length_scale=length_scale[voice],
+                                                    noise_scale=noise_scale[voice], noise_w=noise_w[voice]))
+        audios.extend(silence)
+
     with open(out_file, 'wb') as f:
-        f.write(wav_bytes)
+        f.write(cfg[0].audios_to_wav(audios))
 
 
 def lang_code_to_name(ln):
-    ln_code_2 = ln[:2].upper()
-    co_code_2 = ln[3:]
-    # Patch errors
-    if co_code_2 == 'UK':
-        co_code_2 = 'UA'
-    return (pycountry.languages.get(alpha_2=ln_code_2).name + ' (' +
-            pycountry.countries.get(alpha_2=co_code_2).name + ')')
+    return f"{ln['name_native']} ({ln['name_english']}) [{ln['country_english']}]"
 
 
 def get_voice_name(v):
@@ -191,7 +235,7 @@ def refresh_voices(force_dl=False):
         logger.debug(f"Downloading {url}")
         try:
             result = requests.get(url=url)
-        except HTTPError as http_err:
+        except requests.HTTPError as http_err:
             logger.error(f'HTTP error occurred: {http_err}')
         except Exception as err:
             logger.error(f'Other error occurred: {err}')
@@ -210,10 +254,11 @@ def refresh_voices(force_dl=False):
     name_to_voice = defaultdict(dict)
     total = 0
     for id, data in voices_data.items():
-        if id != f"{data['language']}-{data['name']}-{data['quality']}":
+        language = data['language']
+        if id != f"{language['code']}-{data['name']}-{data['quality']}":
             logger.warning(f"Piper id {id} doesn't match data")
             continue
-        lang = lang_code_to_name(data['language'])
+        lang = lang_code_to_name(language)
         voices_by_lang[lang].append(id)
         vis_name = get_voice_name(data)
         name_to_voice[lang][vis_name] = data
@@ -289,7 +334,7 @@ def change_lang(lang, name):
     """ Update the voice name, use the first for this language if the previous isn't available """
     avail_names = get_voices_for_lang(lang)
     if name not in avail_names:
-       name = avail_names[0]
+        name = avail_names[0]
     return gr.Dropdown.update(choices=avail_names, value=name)
 
 
@@ -354,9 +399,14 @@ def change_enabled(id, activate):
 
 def add_voice_ui(id):
     # Parameters with the id
-    sel_v = f'selected_voice_{id}'
-    speaker_v = f'speaker_{id}'
-    enable_v = f'enable_{id}'
+    id_str = str(id)
+    sel_v = 'selected_voice_' + id_str
+    speaker_v = 'speaker_' + id_str
+    enable_v = 'enable_' + id_str
+    noise_scale_v = 'noise_scale_' + id_str
+    length_scale_v = 'length_scale_' + id_str
+    noise_w_v = 'noise_w_' + id_str
+    use_model_params_v = 'use_model_params_' + id_str
 
     selected = params[sel_v]
     if selected == 'None' or selected is None:
@@ -374,22 +424,38 @@ def add_voice_ui(id):
     params[speaker_v] = sel_speaker if interactive_sp else ''
 
     with gr.Accordion(voice_accordion_label(id), open=False) as accordion:
-        with gr.Row():
-            language = gr.Dropdown(value=sel_lang, choices=languages, label='Language')
-            name = gr.Dropdown(value=sel_name, choices=names, label='Voice name (quality)')
-            voice_id = gr.Number(value=id, visible=False)
+        with gr.Box():
+            with gr.Row():
+                with gr.Column():
+                    language = gr.Dropdown(value=sel_lang, choices=languages, label='Language')
+                    speaker = gr.Dropdown(value=sel_speaker, choices=speakers, label='Speaker', interactive=interactive_sp)
 
-        with gr.Row():
-            speaker = gr.Dropdown(value=sel_speaker, choices=speakers, label='Speaker', interactive=interactive_sp)
-            with gr.Column():
-                activate = gr.Checkbox(value=params[enable_v], label='Enabled')
-                audio_player = gr.HTML(value=get_sample_html(id, current_voice_data, sel_speaker))
+                with gr.Column():
+                    name = gr.Dropdown(value=sel_name, choices=names, label='Voice name (quality)')
+                    voice_id = gr.Number(value=id, visible=False)
+                    activate = gr.Checkbox(value=params[enable_v], label='Enabled')
+                    audio_player = gr.HTML(value=get_sample_html(id, current_voice_data, sel_speaker))
+
+        with gr.Box():
+            with gr.Row():
+                length_scale = gr.Slider(value=params[length_scale_v], label='Length scale (speed)', minimum=0, maximum=2)
+                noise_scale = gr.Slider(value=params[noise_scale_v], label='Noise scale (variability)', minimum=0, maximum=2)
+
+            with gr.Row():
+                noise_w = gr.Slider(value=params[noise_w_v], label='Noise W (cadence)', minimum=0, maximum=2)
+                use_model_params = gr.Checkbox(value=params[use_model_params_v], label='Use model parameters',
+                                               info="When enabled the parameters are ignored. "
+                                               "Note that they doesn't affect the sample voice")
 
     # Event functions to update the parameters in the backend
     language.change(change_lang, inputs=[language, name], outputs=[name])
     name.change(change_voice_name, inputs=[voice_id, language, name, speaker], outputs=[speaker, audio_player, accordion])
     speaker.change(change_speaker, inputs=[voice_id, speaker], outputs=[audio_player, accordion])
     activate.change(change_enabled, inputs=[voice_id, activate], outputs=[accordion])
+    length_scale.change(lambda x: params.update({length_scale_v: x}), length_scale, None)
+    noise_scale.change(lambda x: params.update({noise_scale_v: x}), noise_scale, None)
+    noise_w.change(lambda x: params.update({noise_w_v: x}), noise_w, None)
+    use_model_params.change(lambda x: params.update({use_model_params_v: x}), use_model_params, None)
     return [language, name, speaker]
 
 
@@ -402,6 +468,10 @@ def ui():
         activate = gr.Checkbox(value=params['activate'], label='Activate Text To Speach')
         refresh = gr.Button(value='Reload available voices')
 
+    with gr.Row():
+        autoplay = gr.Checkbox(value=params['autoplay'], label='Play TTS automatically')
+        # show_text = gr.Checkbox(value=params['show_text'], label='Show message text under audio player')
+
     # Add controls for the primary and secondary voices
     outs_0 = add_voice_ui(0)
     outs_1 = add_voice_ui(1)
@@ -409,3 +479,4 @@ def ui():
     # Event functions to update the parameters in the backend
     activate.change(lambda x: params.update({"activate": x}), activate, None)
     refresh.click(refresh_voices_dd, inputs=[], outputs=outs_0 + outs_1)
+    autoplay.change(lambda x: params.update({"autoplay": x}), autoplay, None)
