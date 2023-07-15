@@ -109,24 +109,66 @@ def bot_prefix_modifier(string):
     return string
 
 
-def download_model_file(f_name, name, info):
+def download_model_file(f_name, name, info, progress=None, downloaded=None, total=None, desc=None):
     d_name = os.path.dirname(f_name)
     os.makedirs(d_name, exist_ok=True)
     url = REPO_URL + name
     logger.debug(f'Downloading {url}')
-    result = requests.get(url=url)
-    size = len(result.content)
+    result = requests.get(url=url, stream=True)
+    size = int(result.headers.get('content-length', 0))
     esize = info['size_bytes']
     if size != esize:
         raise ValueError(f'Downloaded size mismatch ({url}) {size} vs {esize}')
+
+    block_size = 64 * 1024
+    content = b''
+    for data in result.iter_content(block_size):
+        if progress is not None:
+            downloaded += len(data)
+            progress(downloaded/total, desc=desc)
+        content += data
+
     h = hashlib.md5()
-    h.update(result.content)
+    h.update(content)
     res_md5 = h.hexdigest()
     e_md5 = info['md5_digest']
     if res_md5 != e_md5:
         raise ValueError(f'Downloaded integrity fail ({url}) {res_md5} vs {e_md5}')
     with open(f_name, 'wb') as f:
-        f.write(result.content)
+        f.write(content)
+
+    return downloaded
+
+
+def check_downloaded(data):
+    for name in data['files'].keys():
+        f_name = os.path.join(MODELS_PATH, name)
+        if not os.path.isfile(f_name):
+            return False
+    return True
+
+
+def download_voice(id, progress=gr.Progress()):
+    files = voices_data[params[f'selected_voice_{int(id)}']]['files']
+    yield (gr.Markdown.update("Downloading voice", visible=True), gr.Button.update(visible=False))
+    progress(0.0, desc="Downloading files")
+    yield (gr.Markdown.update(""), gr.Button.update(visible=False))
+    total = 0
+    for info in files.values():
+        total += info['size_bytes']
+    total_files = len(files)
+    downloaded = 0
+    for c, (name, info) in enumerate(files.items()):
+        f_name = os.path.join(MODELS_PATH, name)
+        if not os.path.isfile(f_name):
+            desc = f"Downloading {name} ({c+1} of {total_files})"
+            progress(downloaded/total, desc=desc)
+            downloaded = download_model_file(f_name, name, info, progress, downloaded, total, desc)
+        else:
+            downloaded += info['size_bytes']
+            progress(downloaded/total, desc=f"Skipping {name}")
+    progress(1.0, desc="Finished")
+    yield (gr.Markdown.update(value="", visible=False), gr.Button.update(visible=False))
 
 
 def check_configured(voice, out_file):
@@ -141,7 +183,8 @@ def check_configured(voice, out_file):
         logger.debug(f'configurando {voice}')
         # Not configured for this voice
         # Check the model files
-        for name, info in data['files'].items():
+        files = data['files']
+        for c, (name, info) in enumerate(files.items()):
             f_name = os.path.join(MODELS_PATH, name)
             if name.endswith('.onnx'):
                 model_name = f_name
@@ -345,11 +388,14 @@ def change_voice_name(id, lang, name, speaker):
     sel_v = f'selected_voice_{id}'
     current_voice_data = name_to_voice[lang][name]
     params[sel_v] = current_voice_data['id']
+    is_downloaded = check_downloaded(current_voice_data)
     logger.debug(f"Selecting piper voice id {id}: `{params[sel_v]}`")
     avail_speakers, new_speaker, interactive = get_new_speaker(current_voice_data, speaker)
     return (gr.Dropdown.update(choices=avail_speakers, value=new_speaker, interactive=interactive),
             gr.HTML.update(value=get_sample_html(id)),
-            gr.Accordion.update(label=voice_accordion_label(id)))
+            gr.Accordion.update(label=voice_accordion_label(id)),
+            gr.Button.update(visible=not is_downloaded),
+            gr.Checkbox.update(value=is_downloaded, visible=is_downloaded))
 
 
 def get_new_speaker(data, speaker, inform=False):
@@ -398,6 +444,11 @@ def change_enabled(id, activate):
     return gr.Accordion.update(label=voice_accordion_label(id))
 
 
+def change_status(str):
+    """ This is used to enable the checkbox after download """
+    return gr.Checkbox.update(value=True, visible=True)
+
+
 def add_voice_ui(id):
     # Parameters with the id
     id_str = str(id)
@@ -423,6 +474,10 @@ def add_voice_ui(id):
     sel_name = current_voice_data['vis_name']
     speakers, sel_speaker, interactive_sp = get_new_speaker(current_voice_data, params[speaker_v], inform=True)
     params[speaker_v] = sel_speaker if interactive_sp else ''
+    is_downloaded = check_downloaded(current_voice_data)
+    if not is_downloaded:
+        # Disable it if the files aren't there
+        params[enable_v] = False
 
     with gr.Accordion(voice_accordion_label(id), open=False) as accordion:
         with gr.Box():
@@ -434,7 +489,7 @@ def add_voice_ui(id):
                 with gr.Column():
                     name = gr.Dropdown(value=sel_name, choices=names, label='Voice name (quality)')
                     voice_id = gr.Number(value=id, visible=False)
-                    activate = gr.Checkbox(value=params[enable_v], label='Enabled')
+                    activate = gr.Checkbox(value=params[enable_v], label='Enabled', visible=is_downloaded)
                     audio_player = gr.HTML(value=get_sample_html(id, current_voice_data, sel_speaker))
 
         with gr.Box():
@@ -448,15 +503,23 @@ def add_voice_ui(id):
                                                info="When enabled the parameters are ignored. "
                                                "Note that they doesn't affect the sample voice")
 
+        with gr.Row():
+            download = gr.Button(value='Download voice', visible=not is_downloaded)
+            download_status = gr.Markdown(visible=False)
+
     # Event functions to update the parameters in the backend
     language.change(change_lang, inputs=[language, name], outputs=[name])
-    name.change(change_voice_name, inputs=[voice_id, language, name, speaker], outputs=[speaker, audio_player, accordion])
+    name.change(change_voice_name, inputs=[voice_id, language, name, speaker],
+                outputs=[speaker, audio_player, accordion, download, activate])
     speaker.change(change_speaker, inputs=[voice_id, speaker], outputs=[audio_player, accordion])
     activate.change(change_enabled, inputs=[voice_id, activate], outputs=[accordion])
     length_scale.change(lambda x: params.update({length_scale_v: x}), length_scale, None)
     noise_scale.change(lambda x: params.update({noise_scale_v: x}), noise_scale, None)
     noise_w.change(lambda x: params.update({noise_w_v: x}), noise_w, None)
     use_model_params.change(lambda x: params.update({use_model_params_v: x}), use_model_params, None)
+    # download.click(download_voice, inputs=[voice_id], outputs=[download_status, download, activate])
+    download.click(download_voice, voice_id, [download_status, download])
+    download_status.change(change_status, download_status, activate)
     return [language, name, speaker]
 
 
