@@ -8,7 +8,8 @@ from extensions.piper_tts.piper import Piper
 import numpy as np
 import requests
 from modules.logging_colors import logger
-from modules import shared
+from modules.utils import gradio
+from modules import shared, chat
 # from pprint import pprint
 
 Piper._LOGGER = logger
@@ -459,6 +460,32 @@ def add_voice_ui(id):
     return [language, name, speaker]
 
 
+def remove_tts_from_history(history):
+    """ Removes all the audio from the chat history """
+    visible = history['visible']  # Contains pairs User/Character
+    for i, entry in enumerate(history['internal']):
+        visible[i] = [visible[i][0], entry[1]]
+
+    return history
+
+
+def toggle_text_in_history(history):
+    """ Shows or hides the text in the history """
+    visible = history['visible']  # Contains pairs User/Character
+    for i, entry in enumerate(history['visible']):
+        visible_reply = entry[1]
+        if visible_reply.startswith('<audio'):
+            if params['show_text']:
+                # Audio + Text
+                reply = history['internal'][i][1]
+                visible[i] = [visible[i][0], f"{visible_reply.split('</audio>')[0]}</audio>\n\n{reply}"]
+            else:
+                # Just the audio
+                visible[i] = [visible[i][0], f"{visible_reply.split('</audio>')[0]}</audio>"]
+
+    return history
+
+
 def ui():
     if not voices_data:
         refresh_voices()
@@ -470,7 +497,33 @@ def ui():
 
     with gr.Row():
         autoplay = gr.Checkbox(value=params['autoplay'], label='Play TTS automatically')
-        # show_text = gr.Checkbox(value=params['show_text'], label='Show message text under audio player')
+        show_text = gr.Checkbox(value=params['show_text'], label='Show message text under audio player')
+
+    if shared.is_chat():
+        with gr.Row():
+            convert = gr.Button('Permanently replace audios with the message texts')
+            convert_cancel = gr.Button('Cancel', visible=False)
+            convert_confirm = gr.Button('Confirm (cannot be undone)', variant="stop", visible=False)
+
+        # Convert history with confirmation
+        convert_arr = [convert_confirm, convert, convert_cancel]
+        confirm_cancel = [gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)]
+        only_convert = [gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)]
+        # On "convert" click change to confirm/cancel
+        convert.click(lambda: confirm_cancel, None, convert_arr)
+        # On "confirm" click remove audios
+        convert_confirm.click(lambda: only_convert, None, convert_arr).\
+            then(remove_tts_from_history, gradio('history'), gradio('history')).\
+            then(chat.save_persistent_history, gradio('history', 'character_menu', 'mode'), None).\
+            then(chat.redraw_html, shared.reload_inputs, gradio('display'))
+        # On "cancel" just change to the convert button
+        convert_cancel.click(lambda: only_convert, None, convert_arr)
+
+        # Toggle message text in history
+        show_text.change(lambda x: params.update({"show_text": x}), show_text, None).\
+            then(toggle_text_in_history, gradio('history'), gradio('history')).\
+            then(chat.save_persistent_history, gradio('history', 'character_menu', 'mode'), None).\
+            then(chat.redraw_html, shared.reload_inputs, gradio('display'))
 
     # Add controls for the primary and secondary voices
     outs_0 = add_voice_ui(0)
