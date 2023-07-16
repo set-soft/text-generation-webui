@@ -1,3 +1,4 @@
+import glob
 from collections import defaultdict
 import hashlib
 import gradio as gr
@@ -5,11 +6,13 @@ import json
 import os
 from pathlib import Path
 from extensions.piper_tts.piper import Piper
+from extensions.piper_tts.piper.samples import text_samples
 import numpy as np
 import requests
 from modules.logging_colors import logger
 from modules.utils import gradio
 from modules import shared, chat
+import time
 # from pprint import pprint
 
 Piper._LOGGER = logger
@@ -19,6 +22,7 @@ VOICES_JSON = "voices.json"
 DATA_DIR = os.path.dirname(__file__)
 VOICE_TYPE = ['Primary', 'Secondary']
 MODELS_PATH = os.path.join("models", "piper")
+OUTPUTS_PATH = os.path.join("extensions", "piper_tts", "outputs")
 # Only one speaker available
 ONLY_ONE = "Only one"
 params = {
@@ -52,6 +56,8 @@ wav_idx = 0
 cfg = [None, None]
 cfg_name = ['', '']
 speaker_id = [0, 0]
+# Text entered by the user
+user_text_samples = {}
 
 
 def input_modifier(string):
@@ -64,6 +70,14 @@ def input_modifier(string):
 
     shared.processing_message = "*Is recording a voice message...*"
     return string
+
+
+def create_output_file_name(base, ext):
+    # The browser will cache the file, so we change its name
+    # But we must delete old files to avoid filling the disk ;-)
+    for f in glob.glob(os.path.join(OUTPUTS_PATH, base + '*' + ext)):
+        os.remove(f)
+    return os.path.join(OUTPUTS_PATH, base + f'_{time.time()}' + ext)
 
 
 def output_modifier(string):
@@ -84,13 +98,13 @@ def output_modifier(string):
     if string == '':
         string = 'empty reply, try regenerating'
 
-    output_file = Path(f'extensions/piper_tts/outputs/{wav_idx:06d}.wav'.format(wav_idx))
-    logger.debug(f'Outputting audio to {str(output_file)}')
+    output_file = create_output_file_name(f'{wav_idx:06d}', '.wav')
+    logger.debug(f'Outputting audio to {output_file}')
 
-    gen_audio_file(string, str(output_file))
+    gen_audio_file(string, output_file)
 
     autoplay = 'autoplay' if params['autoplay'] else ''
-    string = f'<audio src="file/{output_file.as_posix()}" controls {autoplay}></audio>'
+    string = f'<audio src="file/{output_file}" controls {autoplay}></audio>'
     wav_idx += 1
 
     if params['show_text']:
@@ -382,20 +396,26 @@ def change_lang(lang, name):
     return gr.Dropdown.update(choices=avail_names, value=name)
 
 
+def get_sample_text(data):
+    return text_samples.get(data['language']['family'], '???')
+
+
 def change_voice_name(id, lang, name, speaker):
     """ Update the speaker list and selection """
-    id = int(id)
     sel_v = f'selected_voice_{id}'
     current_voice_data = name_to_voice[lang][name]
     params[sel_v] = current_voice_data['id']
     is_downloaded = check_downloaded(current_voice_data)
     logger.debug(f"Selecting piper voice id {id}: `{params[sel_v]}`")
     avail_speakers, new_speaker, interactive = get_new_speaker(current_voice_data, speaker)
-    return (gr.Dropdown.update(choices=avail_speakers, value=new_speaker, interactive=interactive),
+    return (gr.Dropdown.update(choices=avail_speakers, value=new_speaker, visible=interactive),
             gr.HTML.update(value=get_sample_html(id)),
+            gr.Textbox.update(value=get_sample_text(current_voice_data)),
             gr.Accordion.update(label=voice_accordion_label(id)),
             gr.Button.update(visible=not is_downloaded),
-            gr.Checkbox.update(value=is_downloaded, visible=is_downloaded))
+            gr.Checkbox.update(value=is_downloaded, visible=is_downloaded),
+            gr.Button.update(visible=is_downloaded),
+            gr.Markdown.update(visible=not is_downloaded))
 
 
 def get_new_speaker(data, speaker, inform=False):
@@ -408,18 +428,19 @@ def get_new_speaker(data, speaker, inform=False):
 
 
 def change_speaker(id, speaker):
-    id = int(id)
     speaker_v = f'speaker_{id}'
-    params[speaker_v] = speaker if speaker != ONLY_ONE else ''
+    only_one = speaker != ONLY_ONE
+    params[speaker_v] = speaker if only_one else ''
     logger.debug(f"Selecting piper speaker {id}: `{params[speaker_v]}`")
-    return (gr.HTML.update(value=get_sample_html(id)), gr.Accordion.update(label=voice_accordion_label(id)))
+    return (gr.HTML.update(value=get_sample_html(id)),
+            gr.Accordion.update(label=voice_accordion_label(id)))
 
 
 def get_sample_url(id, data=None, speaker=None):
     if data is None:
-        data = voices_data[params[f'selected_voice_{int(id)}']]
+        data = voices_data[params[f'selected_voice_{id}']]
     if speaker is None:
-        speaker = params[f'speaker_{int(id)}']
+        speaker = params[f'speaker_{id}']
     # Find the dir
     dir_name = os.path.dirname(next(iter(data['files'])))
     speaker = str(data['speaker_id_map'].get(speaker, 0))
@@ -432,7 +453,6 @@ def get_sample_html(id, data=None, speaker=None):
 
 
 def voice_accordion_label(id):
-    id = int(id)
     sel_voice = params[f'selected_voice_{id}']
     speaker_v = params[f'speaker_{id}'] if params[f'speaker_{id}'] else ONLY_ONE
     enable_v = 'enabled' if params[f'enable_{id}'] else 'disabled'
@@ -440,13 +460,75 @@ def voice_accordion_label(id):
 
 
 def change_enabled(id, activate):
-    params[f'enable_{int(id)}'] = activate
+    params[f'enable_{id}'] = activate
     return gr.Accordion.update(label=voice_accordion_label(id))
 
 
 def change_status(str):
     """ This is used to enable the checkbox after download """
-    return gr.Checkbox.update(value=True, visible=True)
+    # activate, edit_sample, hint_edit_sample
+    return (gr.Checkbox.update(value=True, visible=True),
+            gr.Button.update(visible=True),
+            gr.Markdown.update(visible=False))
+
+
+def change_use_model_params(id, enable):
+    params[f'use_model_params_{id}'] = enable
+    upd = gr.Slider.update(visible=not enable)
+    return (upd, upd, upd)
+
+
+def edit_sample_text(id):
+    """ When we edit the text we disable the audio player and the edit button.
+        We also enable the generate button and allow to enter new text. """
+    lang = params[f'selected_voice_{id}'][:2]
+    new_text = user_text_samples.get(lang, text_samples.get(lang, '???'))
+    # sample_txt, edit_sample, audio_player, generate
+    return (gr.Textbox.update(interactive=True, value=new_text),
+            gr.Button.update(visible=False),
+            gr.HTML.update(visible=False),
+            gr.Button.update(visible=True))
+
+
+def generate_sample(id, sample_txt):
+    """ Locally generate a sample for the voice """
+    logger.debug(f'Generating for voice {id}: `{sample_txt}`')
+
+    sel = params[f'selected_voice_{id}']
+    data = voices_data[sel]
+    files = data['files']
+    for c, (name, info) in enumerate(files.items()):
+        f_name = os.path.join(MODELS_PATH, name)
+        if name.endswith('.onnx'):
+            model_name = f_name
+            break
+    p = Piper(model_name)
+
+    if params[f'use_model_params_{id}']:
+        noise_scale = length_scale = noise_w = None
+    else:
+        noise_scale = params[f'noise_scale_{id}']
+        length_scale = params[f'length_scale_{id}']
+        noise_w = params[f'noise_w_{id}']
+    sel_speaker = params[f'speaker_{id}']
+    if sel_speaker:
+        speaker_id = data['speaker_id_map'][sel_speaker]
+    else:
+        speaker_id = None
+
+    audios = p.synthesize_partial(sample_txt, speaker_id=speaker_id, length_scale=length_scale, noise_scale=noise_scale,
+                                  noise_w=noise_w)
+    output_file = create_output_file_name(f'sample_{sel}', '.wav')
+    with open(output_file, 'wb') as f:
+        f.write(p.audios_to_wav(audios))
+
+    user_text_samples[sel[:2]] = sample_txt
+
+    # sample_txt, audio_player, edit_sample, generate
+    return (gr.Textbox.update(interactive=False),
+            gr.HTML.update(visible=True, value=f'<audio src="file/{output_file}" controls autoplay></audio>'),
+            gr.Button.update(visible=True),
+            gr.Button.update(visible=False))
 
 
 def add_voice_ui(id):
@@ -484,24 +566,41 @@ def add_voice_ui(id):
             with gr.Row():
                 with gr.Column():
                     language = gr.Dropdown(value=sel_lang, choices=languages, label='Language')
-                    speaker = gr.Dropdown(value=sel_speaker, choices=speakers, label='Speaker', interactive=interactive_sp)
+                    speaker = gr.Dropdown(value=sel_speaker, choices=speakers, label='Speaker', visible=interactive_sp)
 
                 with gr.Column():
                     name = gr.Dropdown(value=sel_name, choices=names, label='Voice name (quality)')
-                    voice_id = gr.Number(value=id, visible=False)
+                    voice_id = gr.Number(value=id, visible=False, precision=0)
                     activate = gr.Checkbox(value=params[enable_v], label='Enabled', visible=is_downloaded)
-                    audio_player = gr.HTML(value=get_sample_html(id, current_voice_data, sel_speaker))
 
         with gr.Box():
-            with gr.Row():
-                length_scale = gr.Slider(value=params[length_scale_v], label='Length scale (speed)', minimum=0, maximum=2)
-                noise_scale = gr.Slider(value=params[noise_scale_v], label='Noise scale (variability)', minimum=0, maximum=2)
+            sample_txt = gr.Textbox(value=get_sample_text(current_voice_data), interactive=False, label='Sample text', lines=2)
 
             with gr.Row():
-                noise_w = gr.Slider(value=params[noise_w_v], label='Noise W (cadence)', minimum=0, maximum=2)
-                use_model_params = gr.Checkbox(value=params[use_model_params_v], label='Use model parameters',
-                                               info="When enabled the parameters are ignored. "
-                                               "Note that they doesn't affect the sample voice")
+                # Sample player: from internet or using a custom text, after downloading the model
+                audio_player = gr.HTML(value=get_sample_html(id, current_voice_data, sel_speaker))
+                # This button is enabled when the user edits the text
+                generate = gr.Button(value='Generate sample', visible=False)
+                # Allow to edit the sample text, only if we have the model
+                edit_sample = gr.Button(value='Edit sample text', visible=is_downloaded)
+                # Help hint to know when the text can be edited
+                hint_edit_sample = gr.Markdown(value='Download the voice to test it using custom text',
+                                               visible=not is_downloaded)
+
+        with gr.Box():
+            use_mp = params[use_model_params_v]
+            use_model_params = gr.Checkbox(value=use_mp, label='Use model parameters',
+                                           info="Disable it to finetune the voice generation. "
+                                                "Note that they don't affect the default voice sample")
+            with gr.Row():
+                noise_scale = gr.Slider(value=params[noise_scale_v], label='Noise scale (variability)', minimum=0, maximum=2,
+                                        visible=not use_mp)
+                noise_w = gr.Slider(value=params[noise_w_v], label='Noise W (cadence)', minimum=0, maximum=2,
+                                    visible=not use_mp)
+
+            with gr.Row():
+                length_scale = gr.Slider(value=params[length_scale_v], label='Length scale (speed)', minimum=0, maximum=2,
+                                         visible=not use_mp)
 
         with gr.Row():
             download = gr.Button(value='Download voice', visible=not is_downloaded)
@@ -510,16 +609,19 @@ def add_voice_ui(id):
     # Event functions to update the parameters in the backend
     language.change(change_lang, inputs=[language, name], outputs=[name])
     name.change(change_voice_name, inputs=[voice_id, language, name, speaker],
-                outputs=[speaker, audio_player, accordion, download, activate])
+                outputs=[speaker, audio_player, sample_txt, accordion, download, activate, edit_sample, hint_edit_sample])
     speaker.change(change_speaker, inputs=[voice_id, speaker], outputs=[audio_player, accordion])
     activate.change(change_enabled, inputs=[voice_id, activate], outputs=[accordion])
     length_scale.change(lambda x: params.update({length_scale_v: x}), length_scale, None)
     noise_scale.change(lambda x: params.update({noise_scale_v: x}), noise_scale, None)
     noise_w.change(lambda x: params.update({noise_w_v: x}), noise_w, None)
-    use_model_params.change(lambda x: params.update({use_model_params_v: x}), use_model_params, None)
-    # download.click(download_voice, inputs=[voice_id], outputs=[download_status, download, activate])
+    use_model_params.change(change_use_model_params, [voice_id, use_model_params], [noise_scale, noise_w, length_scale])
     download.click(download_voice, voice_id, [download_status, download])
-    download_status.change(change_status, download_status, activate)
+    download_status.change(change_status, download_status, [activate, edit_sample, hint_edit_sample])
+    # Enable the textbox, disable the button and enable the generate button
+    edit_sample.click(edit_sample_text, voice_id, [sample_txt, edit_sample, audio_player, generate])
+    generate.click(generate_sample, [voice_id, sample_txt], [sample_txt, audio_player, edit_sample, generate])
+
     return [language, name, speaker]
 
 
