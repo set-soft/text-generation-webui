@@ -140,9 +140,11 @@ class Piper:
         phonemes_str = self.phonemizer.phonemize(text)
 
         total_audio = []
+        total_phonems = []
         for s in phonemes_str.splitlines():
             _LOGGER.debug(s)
             _LOGGER.warning(s)
+            total_phonems.append(s)
             phonemes = [_BOS] + list(s)
             phoneme_ids: List[int] = []
 
@@ -183,7 +185,7 @@ class Piper:
             )[0].squeeze((0, 1))
             total_audio.append(audio.squeeze())
 
-        return total_audio
+        return total_audio, total_phonems
 
     def synthesize(
         self,
@@ -193,7 +195,7 @@ class Piper:
         noise_scale: Optional[float] = None,
         noise_w: Optional[float] = None,
     ) -> bytes:
-        audios = self.synthesize_partial(
+        audios, _ = self.synthesize_partial(
             text,
             speaker_id,
             length_scale,
