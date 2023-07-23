@@ -3,16 +3,20 @@ from collections import defaultdict
 import hashlib
 import gradio as gr
 import json
+import numpy as np
 import os
 from pathlib import Path
+import re
+import requests
+import time
+import yaml
+
 from extensions.piper_tts.piper import Piper
 from extensions.piper_tts.piper.samples import text_samples
-import numpy as np
-import requests
 from modules.logging_colors import logger
+from modules.ui import create_refresh_button
 from modules.utils import gradio
 from modules import shared, chat
-import time
 # from pprint import pprint
 
 Piper._LOGGER = logger
@@ -22,8 +26,13 @@ VOICES_JSON = "voices.json"
 DATA_DIR = os.path.dirname(__file__)
 VOICE_TYPE = ['Primary', 'Secondary']
 MODELS_PATH = os.path.join("models", "piper")
+PRESETS_PATH = os.path.join(MODELS_PATH, "presets")
+PRESETS_P = Path(PRESETS_PATH)
+DEF_PRESET_NAME = 'en_US_amy_and_libritts_p922_(default)'
 USER_SAMPLE_TEXTS = os.path.join(MODELS_PATH, 'user_sample_texts.json')
 OUTPUTS_PATH = os.path.join("extensions", "piper_tts", "outputs")
+HIDE_WIDGET = gr.update(visible=False)
+SHOW_WIDGET = gr.update(visible=True)
 # Only one speaker available
 ONLY_ONE = "Only one"
 params = {
@@ -201,8 +210,9 @@ def check_configured(voice, out_file):
     logger.debug(f'sel {sel}')
     data = voices_data[sel]
     logger.debug(f'cfg_name[voice] {cfg_name[voice]}')
+    loaded = False
     if sel != cfg_name[voice]:
-        logger.debug(f'configurando {voice}')
+        logger.debug(f'Creating session for voice {voice}')
         # Not configured for this voice
         # Check the model files
         files = data['files']
@@ -214,6 +224,7 @@ def check_configured(voice, out_file):
                 download_model_file(f_name, name, info)
         # Create a Piper object
         cfg[voice] = Piper(model_name)
+        loaded = True
         cfg_name[voice] = sel
         # Ensure the output dir exists
         os.makedirs(os.path.dirname(out_file), exist_ok=True)
@@ -222,14 +233,20 @@ def check_configured(voice, out_file):
         speaker_id[voice] = data['speaker_id_map'][sel_speaker]
     else:
         speaker_id[voice] = None
+    return loaded
 
 
 def gen_audio_file(string, out_file):
     global cfg, speaker_id
 
     # Check if configured
+    start_time = time.time()
+    loaded = False
     for v in range(2):
-        check_configured(v, out_file)
+        loaded |= check_configured(v, out_file)
+    elapsed_time = time.time() - start_time
+    if loaded and elapsed_time:
+        logger.debug(f'Models load time: {elapsed_time:5.2f} seconds')
     # Separate description from dialog
     sections = string.split('*')
     voice = 1
@@ -249,6 +266,8 @@ def gen_audio_file(string, out_file):
         length_scale[1] = params['length_scale_1']
         noise_w[1] = params['noise_w_1']
 
+    total_phonems = 0
+    start_time = time.time()
     for s in sections:
         # Alternate voices
         voice = 1 - voice
@@ -257,10 +276,18 @@ def gen_audio_file(string, out_file):
         if not s or not enabled[voice]:
             # Skip empty sections
             continue
-        audios, _ = cfg[voice].synthesize_partial(s, speaker_id=speaker_id[voice], length_scale=length_scale[voice],
+        audio, ps = cfg[voice].synthesize_partial(s, speaker_id=speaker_id[voice], length_scale=length_scale[voice],
                                                   noise_scale=noise_scale[voice], noise_w=noise_w[voice])
-        audios.extend(audios)
-        audios.extend(silence)
+        # Show phonemizer result
+        for p in ps:
+            logger.debug('> ' + p)
+            total_phonems += len(p)
+        # Add this portion of audio and a silence to seprate from the next voice
+        audios.append(audio)
+        audios.append(silence)
+    elapsed_time = time.time() - start_time
+    if elapsed_time:
+        logger.debug(f'{total_phonems} phonems in {elapsed_time:5.2f} seconds {round(total_phonems/elapsed_time)} p/s')
 
     with open(out_file, 'wb') as f:
         f.write(cfg[0].audios_to_wav(audios))
@@ -413,7 +440,8 @@ def change_voice_name(id, lang, name, speaker):
     """ Update the speaker list and selection """
     sel_v = f'selected_voice_{id}'
     current_voice_data = name_to_voice[lang][name]
-    params[sel_v] = current_voice_data['id']
+    voice_id = current_voice_data['id']
+    params[sel_v] = voice_id
     is_downloaded = check_downloaded(current_voice_data)
     logger.debug(f"Selecting piper voice id {id}: `{params[sel_v]}`")
     avail_speakers, new_speaker, interactive = get_new_speaker(current_voice_data, speaker)
@@ -502,6 +530,15 @@ def edit_sample_text(id):
             gr.Textbox.update(visible=False))
 
 
+def save_user_model_params():
+    global user_params
+    try:
+        with open(USER_PARAMS, 'wt') as f:
+            json.dump(user_params, f, indent=2)
+    except Exception as e:
+        logger.error(f'Failed to save JSON file {USER_PARAMS}: {e}')
+
+
 def generate_sample(id, sample_txt):
     """ Locally generate a sample for the voice """
     logger.debug(f'Generating for voice {id}: `{sample_txt}`')
@@ -516,7 +553,8 @@ def generate_sample(id, sample_txt):
             break
     p = Piper(model_name)
 
-    if params[f'use_model_params_{id}']:
+    use_model_params = params[f'use_model_params_{id}']
+    if use_model_params:
         noise_scale = length_scale = noise_w = None
     else:
         noise_scale = params[f'noise_scale_{id}']
@@ -537,12 +575,30 @@ def generate_sample(id, sample_txt):
 
     phonems = '\n'.join(phonems)
 
+    # Memorize the sample text for this language
     user_text_samples[sel[:2]] = sample_txt
     try:
         with open(USER_SAMPLE_TEXTS, 'wt') as f:
             json.dump(user_text_samples, f, indent=2)
     except Exception as e:
         logger.error(f'Failed to save JSON file {USER_SAMPLE_TEXTS}: {e}')
+
+    # Memorize the parameters for this voice
+    sel_w_id = f'{sel}_{id}'
+    global user_params
+    if use_model_params:
+        # Just indicate we are using the model parameters
+        if sel in user_params:
+            user_params[sel_w_id]['use_model_params'] = True
+        else:
+            user_params[sel_w_id] = {'use_model_params': True}
+    else:
+        # Custom values
+        user_params[sel_w_id] = {'use_model_params': False,
+                                 'noise_scale': noise_scale,
+                                 'noise_w': noise_w,
+                                 'length_scale': length_scale}
+    save_user_model_params()
 
     # sample_txt, audio_player, edit_sample, generate, phonems
     return (gr.Textbox.update(interactive=False),
@@ -685,14 +741,130 @@ def toggle_text_in_history(history):
     return history
 
 
+def atoi(text):
+    return int(text) if text.isdigit() else text.lower()
+
+
+def natural_keys(text):
+    return [atoi(c) for c in re.split(r'(\d+)', text)]
+
+
+def get_available_presets():
+    return sorted(set((k.stem for k in Path(PRESETS_PATH).glob('*.yaml'))), key=natural_keys)
+
+
+def get_default_preset():
+    presets_dir = Path(PRESETS_PATH)
+    presets_dir.mkdir(parents=True, exist_ok=True)
+    default_preset = None
+    # Look for the last one selected
+    last_preset = presets_dir/'last_preset.txt'
+    if last_preset.is_file():
+        with last_preset.open() as f:
+            sel_preset = f.readline().strip()
+        if (presets_dir/(sel_preset + '.yaml')).is_file():
+            default_preset = sel_preset
+    # Try to peek one
+    if default_preset is None:
+        first = next(presets_dir.glob('*.yaml'), None)
+        if first is not None:
+            default_preset = first.stem
+    # Nothing there, create one
+    def_preset = presets_dir/(DEF_PRESET_NAME+'.yaml')
+    if not def_preset.exists():
+        with def_preset.open('wt') as f:
+            yaml.dump(params, f, sort_keys=False)
+    if default_preset is None:
+        default_preset = def_preset.stem
+        with last_preset.open('wt') as f:
+            f.write(default_preset)
+    return default_preset
+
+
+def start_save_preset():
+    new_name = 'new_preset_'
+    n = 1
+    while (PRESETS_P/f'user_preset_{n}.yaml').is_file():
+        n += 1
+    return (gr.Textbox.update(value=f'user_preset_{n}'),
+            gr.update(visible=True))
+
+
+def check_preset_name(name):
+    """ Check that this name can be used """
+    if not name:
+        return (HIDE_WIDGET, gr.update(value='Empty name'))
+    res = re.search(r'[^\w\d _\(\),]', name)
+    if res:
+        return (HIDE_WIDGET, gr.Markdown.update(value='Invalid chars in name'))
+    if (PRESETS_P/(name+'.yaml')).exists():
+        return (HIDE_WIDGET, gr.update(value='Name already used'))
+    return (SHOW_WIDGET, gr.update(value='Name is OK'))
+
+
+def do_save_preset(name):
+    """ Save current options as a preset """
+    logger.info(f'Saving preset {name}')
+    with (PRESETS_P/(name+'.yaml')).open(mode='wt') as f:
+        f.write(yaml.dump(params, sort_keys=False))
+    return (HIDE_WIDGET, name)
+
+
+def do_del_preset(name):
+    """ Delete selected preset """
+    logger.info(f'Removing preset {name}')
+    (PRESETS_P/(name+'.yaml')).unlink()
+    # Hide the confirm dialog and select the default
+    return (HIDE_WIDGET, DEF_PRESET_NAME)
+
+
+def do_load_preset(new_preset, old_preset):
+    result = []
+    if new_preset != DEF_PRESET_NAME:
+        result.append(SHOW_WIDGET)
+        result.append(SHOW_WIDGET)
+    else:
+        result.append(HIDE_WIDGET)
+        result.append(HIDE_WIDGET)
+    result.append(new_preset)
+    if new_preset == old_preset:
+        # Save changes the selection, but isn't a real change
+        logger.warning('No se lee')
+        return result
+    logger.warning('Implementar lectura')
+    return result
+
+
+def show_remove_options(name):
+    """ Make the confirmation visible and update the confirmation text """
+    return (SHOW_WIDGET, gr.update(value=f'Are you sure you want to delete the _{name}_ preset?\n\n.'))
+
+
+def show_save_options(name):
+    """ Make the confirmation visible and update the confirmation text """
+    return (SHOW_WIDGET, gr.update(value=f'Are you sure you want to overwrite the _{name}_ preset?\n\n.'))
+
+
 def ui():
     if not voices_data:
         refresh_voices()
+
+    cur_preset_name = get_default_preset()
 
     # Gradio elements
     with gr.Row():
         activate = gr.Checkbox(value=params['activate'], label='Activate Text To Speach')
         refresh = gr.Button(value='Reload available voices')
+
+    with gr.Row():
+        cur_is_default = cur_preset_name == DEF_PRESET_NAME
+        preset_menu = gr.Dropdown(choices=get_available_presets(), value=cur_preset_name,
+                                  label='Configuration presets', elem_classes='slim-dropdown')
+        cur_preset = gr.Textbox(value=cur_preset_name, visible=False)
+        create_refresh_button(preset_menu, lambda: None, lambda: {'choices': get_available_presets()}, 'refresh-button')
+        add_preset = gr.Button('+', elem_classes='refresh-button')
+        save_preset = gr.Button('💾', elem_classes='refresh-button', visible=not cur_is_default)
+        delete_preset = gr.Button('🗑️', elem_classes='refresh-button', visible=not cur_is_default)
 
     with gr.Row():
         autoplay = gr.Checkbox(value=params['autoplay'], label='Play TTS automatically')
@@ -732,3 +904,55 @@ def ui():
     activate.change(lambda x: params.update({"activate": x}), activate, None)
     refresh.click(refresh_voices_dd, inputs=[], outputs=outs_0 + outs_1)
     autoplay.change(lambda x: params.update({"autoplay": x}), autoplay, None)
+
+    # #################
+    # Add preset dialog
+    with gr.Box(visible=False, elem_classes='file-saver') as file_adder:
+        add_filename = gr.Textbox(lines=1, label='New name')
+        name_status = gr.Textbox(value='Name is OK', show_label=False, interactive=False)
+        with gr.Row():
+            add_confirm = gr.Button('Save', elem_classes="small-button")
+            add_cancel = gr.Button('Cancel', elem_classes="small-button")
+
+    # Action for the button to add the preset
+    add_preset.click(start_save_preset, None, [add_filename, file_adder])
+
+    # Add actions
+    add_filename.input(check_preset_name, add_filename, [add_confirm, name_status], show_progress=False)
+    add_confirm.click(do_save_preset, add_filename, [file_adder, cur_preset], show_progress=False).\
+        then(lambda x: gr.Dropdown.update(choices=get_available_presets(), value=x), cur_preset, preset_menu, show_progress=False)
+    add_cancel.click(lambda: HIDE_WIDGET, None, file_adder)
+
+    # ####################
+    # Delete preset dialog
+    with gr.Box(visible=False, elem_classes='file-saver') as file_remover:
+        del_msg = gr.Markdown()
+        with gr.Row():
+            del_confirm = gr.Button('Delete', elem_classes="small-button", variant='stop')
+            del_cancel = gr.Button('Cancel', elem_classes="small-button")
+
+    # Action for the button to remove a preset
+    delete_preset.click(show_remove_options, preset_menu, [file_remover, del_msg], show_progress=False)
+
+    # Delete actions
+    del_cancel.click(lambda: HIDE_WIDGET, None, file_remover, show_progress=False)
+    del_confirm.click(do_del_preset, cur_preset, [file_remover, cur_preset], show_progress=False).\
+        then(lambda x: gr.Dropdown.update(choices=get_available_presets(), value=x), cur_preset, preset_menu, show_progress=False)
+
+    # ##################
+    # Save preset dialog
+    with gr.Box(visible=False, elem_classes='file-saver') as file_saver:
+        save_msg = gr.Markdown()
+        with gr.Row():
+            save_confirm = gr.Button('Replace', elem_classes="small-button", variant='stop')
+            save_cancel = gr.Button('Cancel', elem_classes="small-button")
+
+    # Action for the button to save a preset (overwrite)
+    save_preset.click(show_save_options, preset_menu, [file_saver, save_msg], show_progress=False)
+
+    # Save actions
+    save_cancel.click(lambda: HIDE_WIDGET, None, file_saver, show_progress=False)
+    save_confirm.click(do_save_preset, cur_preset, [file_saver, cur_preset], show_progress=False).\
+        then(lambda x: gr.Dropdown.update(choices=get_available_presets(), value=x), cur_preset, preset_menu, show_progress=False)
+
+    preset_menu.change(do_load_preset, [preset_menu, cur_preset], [save_preset, delete_preset, cur_preset])
