@@ -111,9 +111,10 @@ class Piper:
 
         self.config = load_config(config_path)
         self.phonemizer = Phonemizer(self.config.espeak_voice)
+        sess_ops = onnxruntime.SessionOptions()
         self.model = onnxruntime.InferenceSession(
             str(model_path),
-            sess_options=onnxruntime.SessionOptions(),
+            sess_options=sess_ops,
             providers=["CPUExecutionProvider"]
             if not use_cuda
             else ["CUDAExecutionProvider"],
@@ -128,6 +129,7 @@ class Piper:
         noise_w: Optional[float] = None,
     ) -> List[np.ndarray]:
         """Synthesize WAV audio from text."""
+        # Sanitize the arguments
         if length_scale is None:
             length_scale = self.config.length_scale
 
@@ -137,55 +139,48 @@ class Piper:
         if noise_w is None:
             noise_w = self.config.noise_w
 
+        if (self.config.num_speakers > 1) and (speaker_id is None):
+            # Default speaker
+            speaker_id = 0
+
+        # Run the phonemizer
         phonemes_str = self.phonemizer.phonemize(text)
 
-        total_audio = []
         total_phonems = []
+        # Split the lines and add separators
+        phonemes = []
         for s in phonemes_str.splitlines():
-            _LOGGER.debug(s)
-            _LOGGER.warning(s)
             total_phonems.append(s)
-            phonemes = [_BOS] + list(s)
-            phoneme_ids: List[int] = []
+            phonemes += [_BOS] + list(s) + [_EOS]
 
-            for phoneme in phonemes:
-                if phoneme in self.config.phoneme_id_map:
-                    phoneme_ids.extend(self.config.phoneme_id_map[phoneme])
-                    phoneme_ids.extend(self.config.phoneme_id_map[_PAD])
-                else:
-                    _LOGGER.warning("No id for phoneme: `%s`", phoneme)
+        # Convert the phonemes using the map
+        phoneme_ids: List[int] = []
+        for phoneme in phonemes:
+            if phoneme in self.config.phoneme_id_map:
+                phoneme_ids.extend(self.config.phoneme_id_map[phoneme])
+                phoneme_ids.extend(self.config.phoneme_id_map[_PAD])
+            else:
+                _LOGGER.warning("No id for phoneme: `%s`", phoneme)
+        phoneme_ids.extend(self.config.phoneme_id_map[_EOS])
 
-            phoneme_ids.extend(self.config.phoneme_id_map[_EOS])
+        # Create the tensors needed for the inference
+        phoneme_ids_array = np.expand_dims(np.array(phoneme_ids, dtype=np.int64), 0)
+        phoneme_ids_lengths = np.array([phoneme_ids_array.shape[1]], dtype=np.int64)
+        scales = np.array([noise_scale, length_scale, noise_w], dtype=np.float32)
+        sid = None if speaker_id is None else np.array([speaker_id], dtype=np.int64)
 
-            phoneme_ids_array = np.expand_dims(np.array(phoneme_ids, dtype=np.int64), 0)
-            phoneme_ids_lengths = np.array([phoneme_ids_array.shape[1]], dtype=np.int64)
-            scales = np.array(
-                [noise_scale, length_scale, noise_w],
-                dtype=np.float32,
-            )
+        # Synthesize through Onnx
+        audio = self.model.run(
+            None,
+            {
+                "input": phoneme_ids_array,
+                "input_lengths": phoneme_ids_lengths,
+                "scales": scales,
+                "sid": sid,
+            },
+        )[0].squeeze((0, 1))
 
-            if (self.config.num_speakers > 1) and (speaker_id is None):
-                # Default speaker
-                speaker_id = 0
-
-            sid = None
-
-            if speaker_id is not None:
-                sid = np.array([speaker_id], dtype=np.int64)
-
-            # Synthesize through Onnx
-            audio = self.model.run(
-                None,
-                {
-                    "input": phoneme_ids_array,
-                    "input_lengths": phoneme_ids_lengths,
-                    "scales": scales,
-                    "sid": sid,
-                },
-            )[0].squeeze((0, 1))
-            total_audio.append(audio.squeeze())
-
-        return total_audio, total_phonems
+        return audio.squeeze(), total_phonems
 
     def synthesize(
         self,
